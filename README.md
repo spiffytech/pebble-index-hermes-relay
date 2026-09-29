@@ -2,11 +2,11 @@
 
 ![MutuaL-1.2](https://img.shields.io/badge/License-MutuaL--1.2-af2e1a?style=flat&labelColor=110402&link=https%3A%2F%2Fcodeberg.org%2FMutualism%2FMutualist-License)
 
-Relay for Pebble Index 01 ring webhooks. Verifies the ring's HMAC-SHA256 signature, then
-forwards the request **byte-for-byte** to Hermes, which re-verifies the same bytes.
+The Pebble Index 01 supports HMAC signatures, an so does Hermes but they don't use the same headers etc.
 
-Exists to keep the ring's endpoint off the Hermes container, and to buffer captures
-briefly when Hermes is unavailable (the ring has no retry queue — a failed upload is lost).
+This just relays Index events to Hermes, translating as appropriate. All substantive content is retransmitted verbatim.
+
+Store-and-forwards messages in SQLite in case Hermes is down when you use your Index.
 
 ## Routes
 
