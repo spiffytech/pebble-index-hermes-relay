@@ -103,6 +103,7 @@ interface DeliveryRow {
 
 let lastForwardAt: string | null = null;
 let lastForwardStatus: number | string | null = null;
+let lastForwardError: string | null = null;
 
 // ── Signing ─────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,36 @@ function signatureMatches(expected: string, provided: string): boolean {
   const b = Buffer.from(provided, "utf8");
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
+}
+
+// Base Hermes does not understand the Index signature. It verifies the generic V2 scheme:
+//   X-Webhook-Signature-V2 = hex HMAC-SHA256(secret, "<X-Webhook-Timestamp>.<body>")
+// We add that (plus X-Request-ID so Hermes can dedupe) while still forwarding the original
+// X-Index-* headers, so an Index-aware Hermes keeps working too. The body is never altered.
+function v2Signature(secret: string, timestamp: string, body: Uint8Array): string {
+  const hmac = createHmac("sha256", secret);
+  hmac.update(`${timestamp}.`); // utf-8
+  hmac.update(body);
+  return hmac.digest("hex");
+}
+
+// Signs the body we actually forward, with a fresh timestamp. Both schemes are set: Index (so an
+// Index-aware Hermes still works) and generic V2 (what the base image verifies).
+function signForwardHeaders(
+  headers: Headers,
+  secret: string,
+  body: Uint8Array,
+  meta: { version: string; deliveryId: string; trigger: string; isTest: boolean },
+  timestamp = Math.floor(Date.now() / 1000).toString(),
+): void {
+  headers.set("x-index-timestamp", timestamp);
+  headers.set(
+    "x-index-signature",
+    signIndex(secret, meta.version, timestamp, meta.deliveryId, meta.trigger, meta.isTest, body),
+  );
+  headers.set("x-webhook-timestamp", timestamp);
+  headers.set("x-webhook-signature-v2", v2Signature(secret, timestamp, body));
+  headers.set("x-request-id", meta.deliveryId);
 }
 
 // ── Request helpers ─────────────────────────────────────────────────────────
@@ -156,6 +187,40 @@ function headersToHeadersObject(record: Record<string, string>): Headers {
   return h;
 }
 
+function lastIndexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = haystack.length - needle.length; i >= 0; i--) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Base Hermes does not surface X-Index-Trigger to the agent, but the route prompt expects a
+// `trigger` payload field. Append it as one more multipart part: existing parts are untouched, we
+// only insert before the closing delimiter. Returns the body unchanged when there is no trigger or
+// the boundary cannot be located.
+function injectTrigger(
+  body: Uint8Array,
+  contentType: string,
+  trigger: string,
+): Uint8Array {
+  if (!trigger) return body;
+  const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1];
+  if (!boundary) return body;
+  const closing = Buffer.from(`--${boundary}--`, "utf8");
+  const at = lastIndexOfBytes(body, closing);
+  if (at < 0) return body;
+  const crlf =
+    at >= 2 && body[at - 2] === 0x0d && body[at - 1] === 0x0a ? "" : "\r\n";
+  const part = Buffer.from(
+    `${crlf}--${boundary}\r\nContent-Disposition: form-data; name="trigger"\r\n\r\n${trigger}\r\n`,
+    "utf8",
+  );
+  return Buffer.concat([body.subarray(0, at), part, body.subarray(at)]);
+}
+
 const WEBHOOK_PATH = /^\/webhooks\/.+/;
 const PROFILED_WEBHOOK_PATH = /^\/p\/[^/]+\/webhooks\/.+/;
 
@@ -175,8 +240,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Quick in-request retries: only genuinely transient transport/server statuses.
 function isTransient(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+// Queue decision. Everything non-2xx is retried except statuses where resending the identical
+// request cannot succeed (malformed or oversized body). 401/403/404 are retried on purpose:
+// they reflect external state — secret, route enabled, route exists — that can change, and the
+// relay is the ring's only retry mechanism.
+const PERMANENT_STATUSES = new Set([400, 413, 415, 422]);
+function isRetryable(status: number): boolean {
+  return !PERMANENT_STATUSES.has(status);
 }
 
 function summarize(
@@ -204,11 +279,15 @@ function logRequest(fields: {
   audio: boolean;
   forward: string;
   latencyMs: number;
+  upstreamError?: string;
 }): void {
+  const detail = fields.upstreamError
+    ? ` upstream_error=${JSON.stringify(fields.upstreamError)}`
+    : "";
   console.log(
     `route=${fields.route} delivery=${fields.delivery} trigger=${fields.trigger} test=${fields.test} ` +
       `transcription_len=${fields.transcriptionLength} audio=${fields.audio} ` +
-      `forward=${fields.forward} latency_ms=${Math.round(fields.latencyMs)}`,
+      `forward=${fields.forward} latency_ms=${Math.round(fields.latencyMs)}${detail}`,
   );
 }
 
@@ -241,6 +320,17 @@ async function forwardNow(
     }
   }
   return { response: null, error: lastError };
+}
+
+async function upstreamDetail(response: Response | null, error: unknown): Promise<string> {
+  if (response) {
+    try {
+      return (await response.text()).slice(0, 200);
+    } catch {
+      return "";
+    }
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 function setLastForward(status: Response | null, error: unknown): string {
@@ -300,6 +390,13 @@ function queueDepth(): number {
   return row.n;
 }
 
+function failedCount(): number {
+  const row = db
+    .query("SELECT COUNT(*) AS n FROM deliveries WHERE status='failed'")
+    .get() as { n: number };
+  return row.n;
+}
+
 let draining = false;
 
 async function drain(): Promise<void> {
@@ -325,7 +422,6 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   const headers = headersToHeadersObject(
     JSON.parse(row.headers) as Record<string, string>,
   );
-  const timestamp = Math.floor(Date.now() / 1000).toString();
   const version = headers.get("x-index-webhook-version") || "1";
   const trigger = headers.get("x-index-trigger") || "";
   const isTest =
@@ -339,12 +435,13 @@ async function retryOne(row: DeliveryRow): Promise<void> {
     );
     return;
   }
-  // Re-sign with a fresh timestamp; body bytes are unchanged.
-  headers.set("x-index-timestamp", timestamp);
-  headers.set(
-    "x-index-signature",
-    signIndex(secret, version, timestamp, row.delivery_id, trigger, isTest, row.body),
-  );
+  // Re-sign the stored body (already includes the injected trigger) with a fresh timestamp.
+  signForwardHeaders(headers, secret, row.body, {
+    version,
+    deliveryId: row.delivery_id,
+    trigger,
+    isTest,
+  });
 
   const started = performance.now();
   let response: Response | null = null;
@@ -358,6 +455,7 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   const attempts = row.attempts + 1;
 
   if (response && response.ok) {
+    lastForwardError = null;
     markForwarded(row.delivery_id);
     logRequest({
       route: routeFromPath(row.path),
@@ -370,16 +468,18 @@ async function retryOne(row: DeliveryRow): Promise<void> {
     });
     return;
   }
-  if (response && !isTransient(response.status)) {
-    markFailed(row.delivery_id, `upstream ${response.status}`);
+  const detail = await upstreamDetail(response, error);
+  lastForwardError = `${response ? response.status : "network"}: ${detail}`;
+  if (response && !isRetryable(response.status)) {
+    markFailed(row.delivery_id, lastForwardError);
     console.warn(
-      `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts}`,
+      `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
     );
     return;
   }
-  markPending(row.delivery_id, attempts, error instanceof Error ? error.message : forwardResult);
+  markPending(row.delivery_id, attempts, lastForwardError);
   console.log(
-    `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts}`,
+    `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
   );
 }
 
@@ -402,8 +502,10 @@ Bun.serve({
       return json({
         ok: true,
         queue_depth: queueDepth(),
+        failed_count: failedCount(),
         last_forward_at: lastForwardAt,
         last_forward_status: lastForwardStatus,
+        last_forward_error: lastForwardError,
       });
     }
 
@@ -457,11 +559,17 @@ Bun.serve({
       return json({ error: "invalid signature" }, 401);
     }
 
-    const summary = summarize(body, req.headers);
+    // Base Hermes won't show the gesture, so fold X-Index-Trigger into the body as a field.
+    const forwardBody = injectTrigger(
+      body,
+      req.headers.get("content-type") || "",
+      trigger,
+    );
+    const summary = summarize(forwardBody, req.headers);
     const forwardHeadersRecord = collectForwardHeaders(req.headers);
 
     // Reserve the delivery id first so a concurrent repeat cannot double-forward.
-    if (!enqueue(deliveryId, Date.now(), body, forwardHeadersRecord, forwardPath)) {
+    if (!enqueue(deliveryId, Date.now(), forwardBody, forwardHeadersRecord, forwardPath)) {
       logRequest({
         route,
         delivery: deliveryId,
@@ -474,14 +582,22 @@ Bun.serve({
       return json({ status: "duplicate", delivery_id: deliveryId }, 200);
     }
 
+    const forwardHeaders = headersToHeadersObject(forwardHeadersRecord);
+    signForwardHeaders(forwardHeaders, secret, forwardBody, {
+      version,
+      deliveryId,
+      trigger,
+      isTest,
+    });
     const { response, error } = await forwardNow(
-      headersToHeadersObject(forwardHeadersRecord),
-      body,
+      forwardHeaders,
+      forwardBody,
       forwardPath,
     );
     const forward = setLastForward(response, error);
 
     if (response && response.ok) {
+      lastForwardError = null;
       markForwarded(deliveryId);
       logRequest({
         route,
@@ -498,9 +614,12 @@ Bun.serve({
       );
     }
 
-    if (response && !isTransient(response.status)) {
-      // Permanent 4xx (bad route, body cap, auth mismatch). Retrying will not help.
-      markFailed(deliveryId, `upstream ${response.status}`);
+    const detail = await upstreamDetail(response, error);
+    lastForwardError = `${response ? response.status : "network"}: ${detail}`;
+
+    if (response && !isRetryable(response.status)) {
+      // Malformed or oversized body: resending the same bytes cannot succeed.
+      markFailed(deliveryId, lastForwardError);
       logRequest({
         route,
         delivery: deliveryId,
@@ -509,6 +628,7 @@ Bun.serve({
         ...summary,
         forward,
         latencyMs: performance.now() - started,
+        upstreamError: detail,
       });
       return json(
         { status: "rejected", delivery_id: deliveryId, upstream: response.status },
@@ -516,8 +636,8 @@ Bun.serve({
       );
     }
 
-    // Transient: buffered and retried in the background.
-    markPending(deliveryId, 1, error instanceof Error ? error.message : forward);
+    // Retryable: transient, or an external-state failure like 401/403/404. Buffer and retry.
+    markPending(deliveryId, 1, lastForwardError);
     logRequest({
       route,
       delivery: deliveryId,
@@ -526,6 +646,7 @@ Bun.serve({
       ...summary,
       forward,
       latencyMs: performance.now() - started,
+      upstreamError: detail,
     });
     return json({ status: "buffered", delivery_id: deliveryId }, 202);
   },

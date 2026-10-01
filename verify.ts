@@ -70,6 +70,44 @@ function sha256(body: Uint8Array): string {
   return createHash("sha256").update(body).digest("hex");
 }
 
+function v2sig(timestamp: string, body: Uint8Array): string {
+  const hmac = createHmac("sha256", SECRET);
+  hmac.update(`${timestamp}.`);
+  hmac.update(body);
+  return hmac.digest("hex");
+}
+
+function lastIndexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = haystack.length - needle.length; i >= 0; i--) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Mirror of the relay's injection: the forwarded body gains a `trigger` multipart part.
+function injectTrigger(
+  body: Uint8Array,
+  contentType: string,
+  trigger: string,
+): Uint8Array {
+  if (!trigger) return body;
+  const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1];
+  if (!boundary) return body;
+  const closing = Buffer.from(`--${boundary}--`, "utf8");
+  const at = lastIndexOfBytes(body, closing);
+  if (at < 0) return body;
+  const crlf =
+    at >= 2 && body[at - 2] === 0x0d && body[at - 1] === 0x0a ? "" : "\r\n";
+  const part = Buffer.from(
+    `${crlf}--${boundary}\r\nContent-Disposition: form-data; name="trigger"\r\n\r\n${trigger}\r\n`,
+    "utf8",
+  );
+  return Buffer.concat([body.subarray(0, at), part, body.subarray(at)]);
+}
+
 interface SignedRequest {
   body: Uint8Array;
   signature: string;
@@ -228,6 +266,8 @@ interface Echo {
   sha256: string;
   signature: string | null;
   timestamp: string | null;
+  webhookV2: string | null;
+  webhookTs: string | null;
   delivery: string | null;
   body: Uint8Array;
 }
@@ -243,6 +283,8 @@ function startEcho(): { server: ReturnType<typeof Bun.serve>; seen: Echo[]; url:
         sha256: sha256(body),
         signature: req.headers.get("x-index-signature"),
         timestamp: req.headers.get("x-index-timestamp"),
+        webhookV2: req.headers.get("x-webhook-signature-v2"),
+        webhookTs: req.headers.get("x-webhook-timestamp"),
         delivery: req.headers.get("x-index-delivery"),
         body,
       });
@@ -263,18 +305,19 @@ async function byteExact(): Promise<boolean> {
     const req = makeSigned({ transcription: "byte exact test" });
     const { status } = await post(`http://127.0.0.1:${port}`, req);
     await Bun.sleep(300);
+    const expectedBody = injectTrigger(req.body, req.contentType, req.trigger);
     const got = echo.seen[0];
     if (!got) {
       console.log(`[byte-exact] status=${status} FAIL: echo received nothing`);
       return false;
     }
-    const hashOk = got.sha256 === sha256(req.body);
-    const sigOk = got.signature === req.signature;
+    const hashOk = got.sha256 === sha256(expectedBody);
+    const sigOk = !!got.webhookTs && got.webhookV2 === v2sig(got.webhookTs, expectedBody);
     const pathOk = got.path === "/webhooks/pebble-index";
     console.log(
-      `[byte-exact] status=${status} hash_match=${hashOk} signature_unchanged=${sigOk} path_ok=${pathOk} ok=${hashOk && sigOk && pathOk}`,
+      `[byte-exact] status=${status} parts_preserved=${hashOk} v2_valid=${sigOk} path_ok=${pathOk} ok=${hashOk && sigOk && pathOk}`,
     );
-    console.log(`[byte-exact] sent_sha256=${sha256(req.body)} echoed_sha256=${got.sha256}`);
+    console.log(`[byte-exact] sent_sha256=${sha256(req.body)} forwarded_sha256=${got.sha256}`);
     return hashOk && sigOk && pathOk;
   } finally {
     await stopRelay(proc);
@@ -306,9 +349,11 @@ async function downtime(): Promise<boolean> {
     const deadline = Date.now() + 20000;
     while (echo.seen.length === 0 && Date.now() < deadline) await Bun.sleep(250);
 
+    const expectedBody = injectTrigger(req.body, req.contentType, req.trigger);
     const got = echo.seen[0];
     const forwardedOnce = echo.seen.length === 1;
-    const bytesIntact = !!got && Buffer.compare(Buffer.from(got.body), Buffer.from(req.body)) === 0;
+    const bytesIntact =
+      !!got && Buffer.compare(Buffer.from(got.body), Buffer.from(expectedBody)) === 0;
     const resigned = !!got && got.timestamp !== req.timestamp && got.signature !== req.signature;
     const pathOk = !!got && got.path === "/webhooks/pebble-index";
     const ok = buffered && forwardedOnce && bytesIntact && resigned && pathOk;
