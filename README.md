@@ -2,18 +2,19 @@
 
 ![MutuaL-1.2](https://img.shields.io/badge/License-MutuaL--1.2-af2e1a?style=flat&labelColor=110402&link=https%3A%2F%2Fcodeberg.org%2FMutualism%2FMutualist-License)
 
-The Pebble Index 01 signs its webhook requests with HMAC-SHA256, and Hermes speaks the same
-Index v1 protocol natively. So this relay translates nothing: it verifies the ring's signature,
-then forwards the request byte-for-byte — same method, raw body, `Content-Type` boundary and
-`X-Index-*` headers — and Hermes re-verifies the exact same bytes.
+The Pebble Index 01 signs its webhook requests with HMAC-SHA256 using its own Index v1 protocol.
+Hermes doesn't speak that protocol — its generic webhook receiver takes JSON. So this relay
+verifies the ring's signature, translates the multipart body into Hermes's JSON shape, and signs
+it with Hermes's generic V2 HMAC.
 
 It store-and-forwards through SQLite: if Hermes is down when you use your Index, the capture is
 buffered and retried with backoff instead of lost (the ring has no retry queue).
 
 ## Routes
 
-- `POST /webhooks/*` — verify the ring's signature, dedupe, forward. The path is preserved, so
-  any Hermes webhook route works: `/webhooks/<route>` and `/p/<profile>/webhooks/<route>`.
+- `POST /webhooks/*` — verify the ring's signature, translate to JSON, dedupe, forward. The path
+  is preserved, so any Hermes webhook route works: `/webhooks/<route>` and
+  `/p/<profile>/webhooks/<route>`.
 - `GET /health` — `{ok, queue_depth, last_forward_at, last_forward_status}`.
 
 Hermes' webhook listener serves `POST /webhooks/<route>` (bare, default profile) and
@@ -48,17 +49,21 @@ within ±300 s; constant-time signature compare.
 
 ## Behaviour
 
-- Raw body is read into memory before anything else; it is never re-encoded.
-- Forwarded headers: `Content-Type` (original boundary), `X-Index-*`, `X-Audio-Size`.
+- The ring's `multipart/form-data` body is parsed and re-emitted as `application/json`:
+  `transcription`, `recordedAt` (number, ms), `client`, `event_type` (from `X-Index-Trigger`), and
+  `test: true` for test events.
+- **Audio parts are not forwarded** — Hermes has no audio storage for webhooks. They are dropped
+  and logged (`outcome=audio-dropped`).
+- The JSON is signed with Hermes's generic V2 scheme
+  (`X-Webhook-Signature-V2 = hex HMAC-SHA256(secret, "<X-Webhook-Timestamp>.<body>")`) and sent
+  with `X-Request-ID: <delivery id>` for idempotency. The ring's `X-Index-*` headers are not
+  forwarded.
 - Idempotency: SQLite `deliveries` table keyed on `X-Index-Delivery`. A repeat returns 200
   without forwarding.
-- Hermes 2xx → forwarded (202). Network error / 5xx / 429 / 408 / 425 → buffered in SQLite and
-  retried with backoff (5 s, 30 s, 2 m, 10 m, 1 h, hourly). Permanent 4xx → not buffered
-  (502). Only a failure to persist returns 503.
-- **Deferred retries are re-signed with a fresh `X-Index-Timestamp`.** Hermes rejects anything
-  older than 300 s, so a raw replay of a buffered request would 401. The body bytes are
-  unchanged; only the timestamp and signature headers are refreshed. Immediate forwards are
-  never re-signed.
+- Hermes 2xx → forwarded (202). Network error / 5xx / 429 / 408 / 425, and 401/403/404 → buffered
+  in SQLite and retried with backoff (5 s, 30 s, 2 m, 10 m, 1 h, hourly). Permanent (400/413/415/422)
+  → not buffered (502). Only a failure to persist returns 503.
+- Buffered retries are re-signed with a fresh `X-Webhook-Timestamp`.
 
 ## Env
 
@@ -72,11 +77,11 @@ within ±300 s; constant-time signature compare.
 
 ## Tests
 
-`verify.ts` is a standalone harness. The `byte-exact` and `downtime` cases are self-contained —
+`verify.ts` is a standalone harness. The `translate` and `downtime` cases are self-contained —
 they spawn their own relay and echo server on loopback:
 
 ```sh
-WEBHOOK_SECRET_PEBBLE_INDEX=test bun verify.ts byte-exact
+WEBHOOK_SECRET_PEBBLE_INDEX=test bun verify.ts translate
 WEBHOOK_SECRET_PEBBLE_INDEX=test bun verify.ts downtime
 ```
 

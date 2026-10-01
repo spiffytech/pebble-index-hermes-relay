@@ -2,17 +2,17 @@
 /**
  * Pebble Index 01 ring → Hermes webhook relay.
  *
- * Verifies the ring's HMAC-SHA256 signature, then forwards the request byte-for-byte
- * to Hermes (same method, raw body, Content-Type boundary and X-Index-* headers).
- * Hermes re-verifies the same bytes, so we never touch the body.
+ * Verifies the ring's HMAC-SHA256 signature over the original multipart body, then translates
+ * that body into the JSON payload base Hermes expects: the multipart fields become JSON fields,
+ * `event_type` is taken from X-Index-Trigger, and `test` becomes a boolean. Audio is not
+ * forwarded (base Hermes has no audio storage for webhooks).
  *
- * Any webhook path is accepted and forwarded verbatim under the configured Hermes root:
- * `POST /webhooks/<route>` and `POST /p/<profile>/webhooks/<route>`.
+ * The translated JSON is signed with Hermes's generic V2 HMAC and sent with X-Request-ID for
+ * idempotency. Any webhook path is accepted and forwarded verbatim under the configured Hermes
+ * root: `POST /webhooks/<route>` and `POST /p/<profile>/webhooks/<route>`.
  *
- * Durability: if Hermes is unreachable or transiently failing, the request is buffered
- * in SQLite and retried with backoff. Hermes rejects requests whose X-Index-Timestamp is
- * more than 300s old, so buffered retries are re-signed with a fresh timestamp — the raw
- * body bytes are never altered.
+ * Durability: if Hermes is unreachable or transiently failing, the translated body is buffered in
+ * SQLite and retried with backoff, re-signed with a fresh timestamp each attempt.
  */
 import { Database } from "bun:sqlite";
 import { createHmac, timingSafeEqual } from "crypto";
@@ -130,10 +130,11 @@ function signatureMatches(expected: string, provided: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-// Base Hermes does not understand the Index signature. It verifies the generic V2 scheme:
+// Base Hermes verifies the generic V2 scheme:
 //   X-Webhook-Signature-V2 = hex HMAC-SHA256(secret, "<X-Webhook-Timestamp>.<body>")
-// We add that (plus X-Request-ID so Hermes can dedupe) while still forwarding the original
-// X-Index-* headers, so an Index-aware Hermes keeps working too. The body is never altered.
+// X-Request-ID carries the delivery id for Hermes's idempotency. The ring's X-Index-* headers are
+// not forwarded: base Hermes reads none of them, and the Index signature covers the multipart body
+// we replace with JSON.
 function v2Signature(secret: string, timestamp: string, body: Uint8Array): string {
   const hmac = createHmac("sha256", secret);
   hmac.update(`${timestamp}.`); // utf-8
@@ -141,84 +142,70 @@ function v2Signature(secret: string, timestamp: string, body: Uint8Array): strin
   return hmac.digest("hex");
 }
 
-// Signs the body we actually forward, with a fresh timestamp. Both schemes are set: Index (so an
-// Index-aware Hermes still works) and generic V2 (what the base image verifies).
 function signForwardHeaders(
   headers: Headers,
   secret: string,
   body: Uint8Array,
-  meta: { version: string; deliveryId: string; trigger: string; isTest: boolean },
+  deliveryId: string,
   timestamp = Math.floor(Date.now() / 1000).toString(),
 ): void {
-  headers.set("x-index-timestamp", timestamp);
-  headers.set(
-    "x-index-signature",
-    signIndex(secret, meta.version, timestamp, meta.deliveryId, meta.trigger, meta.isTest, body),
-  );
   headers.set("x-webhook-timestamp", timestamp);
   headers.set("x-webhook-signature-v2", v2Signature(secret, timestamp, body));
-  headers.set("x-request-id", meta.deliveryId);
+  headers.set("x-request-id", deliveryId);
 }
 
-// ── Request helpers ─────────────────────────────────────────────────────────
+// ── Translation ─────────────────────────────────────────────────────────────
 
-const FORWARDED_PREFIXES = ["x-index-"];
-const FORWARDED_EXACT = new Set(["x-audio-size"]);
-
-function collectForwardHeaders(headers: Headers): Record<string, string> {
-  const out: Record<string, string> = {};
-  const contentType = headers.get("content-type");
-  if (contentType) out["content-type"] = contentType;
-  for (const [key, value] of headers) {
-    const lower = key.toLowerCase();
-    if (
-      FORWARDED_PREFIXES.some((p) => lower.startsWith(p)) ||
-      FORWARDED_EXACT.has(lower)
-    ) {
-      out[lower] = value;
-    }
+async function parseForm(body: Uint8Array, contentType: string) {
+  try {
+    return await new Request("http://relay.invalid/", {
+      method: "POST",
+      headers: { "content-type": contentType },
+      body,
+    }).formData();
+  } catch {
+    return null;
   }
-  return out;
 }
 
-function headersToHeadersObject(record: Record<string, string>): Headers {
-  const h = new Headers();
-  for (const [k, v] of Object.entries(record)) h.set(k, v);
-  return h;
-}
-
-function lastIndexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
-  outer: for (let i = haystack.length - needle.length; i >= 0; i--) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
-}
-
-// Base Hermes does not surface X-Index-Trigger to the agent, but the route prompt expects a
-// `trigger` payload field. Append it as one more multipart part: existing parts are untouched, we
-// only insert before the closing delimiter. Returns the body unchanged when there is no trigger or
-// the boundary cannot be located.
-function injectTrigger(
+// The ring posts multipart/form-data; base Hermes parses only JSON or form-encoded. Turn the
+// multipart fields into a JSON payload, add `event_type` (from X-Index-Trigger) and a boolean
+// `test`. Audio parts are dropped for now — base Hermes has no audio storage for webhooks.
+async function translateToHermes(
   body: Uint8Array,
   contentType: string,
   trigger: string,
-): Uint8Array {
-  if (!trigger) return body;
-  const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1];
-  if (!boundary) return body;
-  const closing = Buffer.from(`--${boundary}--`, "utf8");
-  const at = lastIndexOfBytes(body, closing);
-  if (at < 0) return body;
-  const crlf =
-    at >= 2 && body[at - 2] === 0x0d && body[at - 1] === 0x0a ? "" : "\r\n";
-  const part = Buffer.from(
-    `${crlf}--${boundary}\r\nContent-Disposition: form-data; name="trigger"\r\n\r\n${trigger}\r\n`,
-    "utf8",
-  );
-  return Buffer.concat([body.subarray(0, at), part, body.subarray(at)]);
+  isTest: boolean,
+): Promise<
+  { body: Uint8Array; transcriptionLength: number; audioDropped: boolean } | null
+> {
+  const form = await parseForm(body, contentType);
+  if (!form) return null;
+  const payload: Record<string, unknown> = {};
+  let transcriptionLength = 0;
+  let audioDropped = false;
+  for (const [key, value] of form.entries()) {
+    if (typeof value !== "string") {
+      audioDropped = true;
+      continue;
+    }
+    if (key === "test") continue; // derived from the signed X-Index-Test header
+    if (key === "recordedAt" && /^\d+$/.test(value)) {
+      payload[key] = Number(value);
+    } else {
+      payload[key] = value;
+      if (key === "transcription") {
+        transcriptionLength = Buffer.byteLength(value, "utf8");
+      }
+    }
+  }
+  payload.event_type = trigger;
+  if (isTest) payload.test = true;
+  return {
+    body: Buffer.from(JSON.stringify(payload), "utf8"),
+    transcriptionLength,
+    audioDropped,
+  };
 }
 
 const WEBHOOK_PATH = /^\/webhooks\/.+/;
@@ -254,20 +241,28 @@ function isRetryable(status: number): boolean {
   return !PERMANENT_STATUSES.has(status);
 }
 
-function summarize(
-  body: Uint8Array,
-  headers: Headers,
-): { transcriptionLength: number; audio: boolean } {
-  // Logging only; never mutates the body.
-  const text = Buffer.from(body).toString("latin1");
-  let transcriptionLength = 0;
-  const m =
-    /name="transcription"\r\n(?:[^\r\n]*\r\n)*\r\n([\s\S]*?)\r\n--/.exec(text);
-  if (m && m[1] !== undefined) {
-    transcriptionLength = Buffer.byteLength(m[1], "latin1");
+// Recover log fields from a translated (stored) JSON body.
+function jsonLogFields(body: Uint8Array): {
+  trigger: string;
+  test: boolean;
+  transcriptionLength: number;
+} {
+  try {
+    const p = JSON.parse(Buffer.from(body).toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    return {
+      trigger: typeof p.event_type === "string" ? p.event_type : "",
+      test: p.test === true,
+      transcriptionLength:
+        typeof p.transcription === "string"
+          ? Buffer.byteLength(p.transcription, "utf8")
+          : 0,
+    };
+  } catch {
+    return { trigger: "", test: false, transcriptionLength: 0 };
   }
-  const audio = headers.has("x-audio-size") || /name="audio"/.test(text);
-  return { transcriptionLength, audio };
 }
 
 function logRequest(fields: {
@@ -419,13 +414,6 @@ async function drain(): Promise<void> {
 }
 
 async function retryOne(row: DeliveryRow): Promise<void> {
-  const headers = headersToHeadersObject(
-    JSON.parse(row.headers) as Record<string, string>,
-  );
-  const version = headers.get("x-index-webhook-version") || "1";
-  const trigger = headers.get("x-index-trigger") || "";
-  const isTest =
-    (headers.get("x-index-test") || "").trim().toLowerCase() === "true";
   const route = routeFromPath(row.path);
   const secret = routeSecret(route);
   if (!secret) {
@@ -435,13 +423,9 @@ async function retryOne(row: DeliveryRow): Promise<void> {
     );
     return;
   }
-  // Re-sign the stored body (already includes the injected trigger) with a fresh timestamp.
-  signForwardHeaders(headers, secret, row.body, {
-    version,
-    deliveryId: row.delivery_id,
-    trigger,
-    isTest,
-  });
+  const fields = jsonLogFields(row.body);
+  const headers = new Headers({ "content-type": "application/json" });
+  signForwardHeaders(headers, secret, row.body, row.delivery_id);
 
   const started = performance.now();
   let response: Response | null = null;
@@ -458,11 +442,12 @@ async function retryOne(row: DeliveryRow): Promise<void> {
     lastForwardError = null;
     markForwarded(row.delivery_id);
     logRequest({
-      route: routeFromPath(row.path),
+      route,
       delivery: row.delivery_id,
-      trigger,
-      test: isTest,
-      ...summarize(row.body, headers),
+      trigger: fields.trigger,
+      test: fields.test,
+      transcriptionLength: fields.transcriptionLength,
+      audio: false,
       forward: forwardResult,
       latencyMs: performance.now() - started,
     });
@@ -473,13 +458,13 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   if (response && !isRetryable(response.status)) {
     markFailed(row.delivery_id, lastForwardError);
     console.warn(
-      `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
+      `route=${route} delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
     );
     return;
   }
   markPending(row.delivery_id, attempts, lastForwardError);
   console.log(
-    `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
+    `route=${route} delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts} upstream_error=${JSON.stringify(detail)}`,
   );
 }
 
@@ -559,17 +544,27 @@ Bun.serve({
       return json({ error: "invalid signature" }, 401);
     }
 
-    // Base Hermes won't show the gesture, so fold X-Index-Trigger into the body as a field.
-    const forwardBody = injectTrigger(
+    // Translate the ring's multipart body into the JSON payload base Hermes parses.
+    const translated = await translateToHermes(
       body,
       req.headers.get("content-type") || "",
       trigger,
+      isTest,
     );
-    const summary = summarize(forwardBody, req.headers);
-    const forwardHeadersRecord = collectForwardHeaders(req.headers);
+    if (!translated) {
+      console.warn(`route=${route} delivery=${deliveryId} outcome=unparseable-body`);
+      return json({ error: "cannot parse body" }, 400);
+    }
+    const { body: forwardBody, transcriptionLength, audioDropped } = translated;
+    const summary = { transcriptionLength, audio: audioDropped };
+    if (audioDropped) {
+      console.warn(
+        `route=${route} delivery=${deliveryId} outcome=audio-dropped (audio is not forwarded)`,
+      );
+    }
 
     // Reserve the delivery id first so a concurrent repeat cannot double-forward.
-    if (!enqueue(deliveryId, Date.now(), forwardBody, forwardHeadersRecord, forwardPath)) {
+    if (!enqueue(deliveryId, Date.now(), forwardBody, {}, forwardPath)) {
       logRequest({
         route,
         delivery: deliveryId,
@@ -582,13 +577,8 @@ Bun.serve({
       return json({ status: "duplicate", delivery_id: deliveryId }, 200);
     }
 
-    const forwardHeaders = headersToHeadersObject(forwardHeadersRecord);
-    signForwardHeaders(forwardHeaders, secret, forwardBody, {
-      version,
-      deliveryId,
-      trigger,
-      isTest,
-    });
+    const forwardHeaders = new Headers({ "content-type": "application/json" });
+    signForwardHeaders(forwardHeaders, secret, forwardBody, deliveryId);
     const { response, error } = await forwardNow(
       forwardHeaders,
       forwardBody,

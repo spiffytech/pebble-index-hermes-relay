@@ -5,7 +5,7 @@
  *   RELAY_URL=http://127.0.0.1:8655 bun verify.ts happy
  *   bun verify.ts tamper
  *   bun verify.ts replay
- *   bun verify.ts byte-exact      # spawns relay locally against an echo server
+ *   bun verify.ts translate      # spawns relay locally against an echo server
  *   bun verify.ts downtime        # spawns relay locally against a dead port, then restores
  *   bun verify.ts all             # happy+tamper+replay against RELAY_URL, then the two local tests
  *
@@ -75,37 +75,6 @@ function v2sig(timestamp: string, body: Uint8Array): string {
   hmac.update(`${timestamp}.`);
   hmac.update(body);
   return hmac.digest("hex");
-}
-
-function lastIndexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
-  outer: for (let i = haystack.length - needle.length; i >= 0; i--) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
-}
-
-// Mirror of the relay's injection: the forwarded body gains a `trigger` multipart part.
-function injectTrigger(
-  body: Uint8Array,
-  contentType: string,
-  trigger: string,
-): Uint8Array {
-  if (!trigger) return body;
-  const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1];
-  if (!boundary) return body;
-  const closing = Buffer.from(`--${boundary}--`, "utf8");
-  const at = lastIndexOfBytes(body, closing);
-  if (at < 0) return body;
-  const crlf =
-    at >= 2 && body[at - 2] === 0x0d && body[at - 1] === 0x0a ? "" : "\r\n";
-  const part = Buffer.from(
-    `${crlf}--${boundary}\r\nContent-Disposition: form-data; name="trigger"\r\n\r\n${trigger}\r\n`,
-    "utf8",
-  );
-  return Buffer.concat([body.subarray(0, at), part, body.subarray(at)]);
 }
 
 interface SignedRequest {
@@ -263,6 +232,7 @@ async function stopRelay(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
 
 interface Echo {
   path: string;
+  contentType: string | null;
   sha256: string;
   signature: string | null;
   timestamp: string | null;
@@ -280,6 +250,7 @@ function startEcho(): { server: ReturnType<typeof Bun.serve>; seen: Echo[]; url:
       const body = new Uint8Array(await req.arrayBuffer());
       seen.push({
         path: new URL(req.url).pathname,
+        contentType: req.headers.get("content-type"),
         sha256: sha256(body),
         signature: req.headers.get("x-index-signature"),
         timestamp: req.headers.get("x-index-timestamp"),
@@ -296,29 +267,41 @@ function startEcho(): { server: ReturnType<typeof Bun.serve>; seen: Echo[]; url:
 
 let nextPort = 18655;
 
-async function byteExact(): Promise<boolean> {
+async function translate(): Promise<boolean> {
   const echo = startEcho();
   const dataDir = mkdtempSync(join(tmpdir(), "pebble-relay-"));
   const port = nextPort++;
   const proc = await startRelay(port, echo.url, dataDir);
   try {
-    const req = makeSigned({ transcription: "byte exact test" });
+    const req = makeSigned({ transcription: "translate test" });
     const { status } = await post(`http://127.0.0.1:${port}`, req);
     await Bun.sleep(300);
-    const expectedBody = injectTrigger(req.body, req.contentType, req.trigger);
     const got = echo.seen[0];
     if (!got) {
-      console.log(`[byte-exact] status=${status} FAIL: echo received nothing`);
+      console.log(`[translate] status=${status} FAIL: echo received nothing`);
       return false;
     }
-    const hashOk = got.sha256 === sha256(expectedBody);
-    const sigOk = !!got.webhookTs && got.webhookV2 === v2sig(got.webhookTs, expectedBody);
+    const json = JSON.parse(Buffer.from(got.body).toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    const jsonType = (got.contentType ?? "").startsWith("application/json");
+    const fieldsOk =
+      json.transcription === "translate test" &&
+      json.event_type === req.trigger &&
+      json.test === true &&
+      json.client === "ring" &&
+      typeof json.recordedAt === "number";
+    const v2Ok = !!got.webhookTs && got.webhookV2 === v2sig(got.webhookTs, got.body);
     const pathOk = got.path === "/webhooks/pebble-index";
+    const ok = jsonType && fieldsOk && v2Ok && pathOk;
     console.log(
-      `[byte-exact] status=${status} parts_preserved=${hashOk} v2_valid=${sigOk} path_ok=${pathOk} ok=${hashOk && sigOk && pathOk}`,
+      `[translate] status=${status} json=${jsonType} fields_ok=${fieldsOk} v2_valid=${v2Ok} path_ok=${pathOk} ok=${ok}`,
     );
-    console.log(`[byte-exact] sent_sha256=${sha256(req.body)} forwarded_sha256=${got.sha256}`);
-    return hashOk && sigOk && pathOk;
+    console.log(
+      `[translate] forwarded=${Buffer.from(got.body).toString("utf8").slice(0, 200)}`,
+    );
+    return ok;
   } finally {
     await stopRelay(proc);
     echo.server.stop(true);
@@ -349,24 +332,20 @@ async function downtime(): Promise<boolean> {
     const deadline = Date.now() + 20000;
     while (echo.seen.length === 0 && Date.now() < deadline) await Bun.sleep(250);
 
-    const expectedBody = injectTrigger(req.body, req.contentType, req.trigger);
     const got = echo.seen[0];
     const forwardedOnce = echo.seen.length === 1;
-    const bytesIntact =
-      !!got && Buffer.compare(Buffer.from(got.body), Buffer.from(expectedBody)) === 0;
-    const resigned = !!got && got.timestamp !== req.timestamp && got.signature !== req.signature;
+    const json = got
+      ? (JSON.parse(Buffer.from(got.body).toString("utf8")) as Record<string, unknown>)
+      : null;
+    const fieldsOk =
+      !!json && json.transcription === "downtime test" && json.event_type === req.trigger;
+    const v2Ok = !!got && !!got.webhookTs && got.webhookV2 === v2sig(got.webhookTs, got.body);
     const pathOk = !!got && got.path === "/webhooks/pebble-index";
-    const ok = buffered && forwardedOnce && bytesIntact && resigned && pathOk;
+    const ok = buffered && forwardedOnce && fieldsOk && v2Ok && pathOk;
     console.log(
-      `[downtime] forwarded_count=${echo.seen.length} bytes_intact=${bytesIntact} ` +
-        `resigned=${resigned} path_ok=${pathOk} ok=${ok}`,
+      `[downtime] forwarded_count=${echo.seen.length} fields_ok=${fieldsOk} v2_valid=${v2Ok} ` +
+        `path_ok=${pathOk} ok=${ok}`,
     );
-    if (got) {
-      console.log(
-        `[downtime] original_ts=${req.timestamp} retry_ts=${got.timestamp} ` +
-          `original_sig=${req.signature.slice(0, 12)}… retry_sig=${(got.signature ?? "").slice(0, 12)}…`,
-      );
-    }
     return ok;
   } finally {
     await stopRelay(first);
@@ -412,8 +391,8 @@ switch (cmd) {
   case "replay":
     results.replay = await replay();
     break;
-  case "byte-exact":
-    results["byte-exact"] = await byteExact();
+  case "translate":
+    results.translate = await translate();
     break;
   case "downtime":
     results.downtime = await downtime();
@@ -428,7 +407,7 @@ switch (cmd) {
     results.tamper = await tamper();
     results.replay = await replay();
     console.log("# local tests");
-    results["byte-exact"] = await byteExact();
+    results.translate = await translate();
     results.downtime = await downtime();
     results.paths = await pathForwarding();
     break;
