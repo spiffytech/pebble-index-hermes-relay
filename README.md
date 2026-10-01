@@ -2,24 +2,33 @@
 
 ![MutuaL-1.2](https://img.shields.io/badge/License-MutuaL--1.2-af2e1a?style=flat&labelColor=110402&link=https%3A%2F%2Fcodeberg.org%2FMutualism%2FMutualist-License)
 
-The Pebble Index 01 supports HMAC signatures, an so does Hermes but they don't use the same headers etc.
+The Pebble Index 01 signs its webhook requests with HMAC-SHA256, and Hermes speaks the same
+Index v1 protocol natively. So this relay translates nothing: it verifies the ring's signature,
+then forwards the request byte-for-byte — same method, raw body, `Content-Type` boundary and
+`X-Index-*` headers — and Hermes re-verifies the exact same bytes.
 
-This just relays Index events to Hermes, translating as appropriate. All substantive content is retransmitted verbatim.
-
-Store-and-forwards messages in SQLite in case Hermes is down when you use your Index.
+It store-and-forwards through SQLite: if Hermes is down when you use your Index, the capture is
+buffered and retried with backoff instead of lost (the ring has no retry queue).
 
 ## Routes
 
-- `POST /webhooks/pebble-index` — verify, dedupe, forward.
-- `GET /healthz` — `{ok, queue_depth, last_forward_at, last_forward_status}`.
+- `POST /webhooks/*` — verify the ring's signature, dedupe, forward. The path is preserved, so
+  any Hermes webhook route works: `/webhooks/<route>` and `/p/<profile>/webhooks/<route>`.
+- `GET /health` — `{ok, queue_depth, last_forward_at, last_forward_status}`.
+
+Hermes' webhook listener serves `POST /webhooks/<route>` (bare, default profile) and
+`POST /p/<profile>/webhooks/<route>` (profile-scoped). The relay forwards the incoming path
+verbatim under `HERMES_WEBHOOK_ROOT`, so new routes need no relay change once a secret is
+configured for them. Each route's secret comes from `WEBHOOK_SECRET_<ROUTE>` (see Env).
+Verification is Index-only, so routes using a different auth scheme are not supported.
 
 ## Run
 
 ```sh
 docker build -t pebble-hermes-relay .
 docker run --rm -p 8655:8655 \
-  -e PEBBLE_INDEX_WEBHOOK_SECRET=... \
-  -e HERMES_WEBHOOK_URL=http://hermes:8644/webhooks/pebble-index \
+  -e WEBHOOK_SECRET_PEBBLE_INDEX=... \
+  -e HERMES_WEBHOOK_ROOT=http://hermes:8644 \
   -v pebble-hermes-relay-data:/data \
   pebble-hermes-relay
 ```
@@ -27,7 +36,7 @@ docker run --rm -p 8655:8655 \
 Or directly with Bun:
 
 ```sh
-PEBBLE_INDEX_WEBHOOK_SECRET=... bun run start
+WEBHOOK_SECRET_PEBBLE_INDEX=... bun run start
 ```
 
 ## Protocol (Index webhook v1)
@@ -56,8 +65,8 @@ within ±300 s; constant-time signature compare.
 | Var | Default | Notes |
 |---|---|---|
 | `PORT` | `8655` | |
-| `PEBBLE_INDEX_WEBHOOK_SECRET` | — | HMAC secret configured for the webhook route |
-| `HERMES_WEBHOOK_URL` | `http://127.0.0.1:8644/webhooks/pebble-index` | target endpoint |
+| `WEBHOOK_SECRET_<ROUTE>` | — | HMAC secret per route, e.g. `WEBHOOK_SECRET_PEBBLE_INDEX` for `pebble-index`. Route names are uppercased and non-alphanumerics become `_`. No fallback: an unconfigured route is rejected. |
+| `HERMES_WEBHOOK_ROOT` | `http://127.0.0.1:8644` | Hermes webhook listener origin; the relay appends the incoming path (a trailing `/webhooks` is tolerated) |
 | `DATA_DIR` | `./data` | SQLite lives here |
 | `TIMESTAMP_WINDOW_SECONDS` | `300` | |
 
@@ -67,20 +76,20 @@ within ±300 s; constant-time signature compare.
 they spawn their own relay and echo server on loopback:
 
 ```sh
-PEBBLE_INDEX_WEBHOOK_SECRET=test bun verify.ts byte-exact
-PEBBLE_INDEX_WEBHOOK_SECRET=test bun verify.ts downtime
+WEBHOOK_SECRET_PEBBLE_INDEX=test bun verify.ts byte-exact
+WEBHOOK_SECRET_PEBBLE_INDEX=test bun verify.ts downtime
 ```
 
 The `happy`, `tamper` and `replay` cases hit a running relay, so they need its URL and secret:
 
 ```sh
-RELAY_URL=http://127.0.0.1:8655 PEBBLE_INDEX_WEBHOOK_SECRET=... bun verify.ts happy
-RELAY_URL=http://127.0.0.1:8655 PEBBLE_INDEX_WEBHOOK_SECRET=... bun verify.ts tamper
-RELAY_URL=http://127.0.0.1:8655 PEBBLE_INDEX_WEBHOOK_SECRET=... bun verify.ts replay
+RELAY_URL=http://127.0.0.1:8655 WEBHOOK_SECRET_PEBBLE_INDEX=... bun verify.ts happy
+RELAY_URL=http://127.0.0.1:8655 WEBHOOK_SECRET_PEBBLE_INDEX=... bun verify.ts tamper
+RELAY_URL=http://127.0.0.1:8655 WEBHOOK_SECRET_PEBBLE_INDEX=... bun verify.ts replay
 ```
 
 `bun verify.ts all` runs everything. The happy-path case forwards a test event to the configured
-`HERMES_WEBHOOK_URL`; confirm the run on the receiving side via its log and reply channel.
+`HERMES_WEBHOOK_ROOT`; confirm the run on the receiving side via its log and reply channel.
 
 ## License
 

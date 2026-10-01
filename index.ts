@@ -6,6 +6,9 @@
  * to Hermes (same method, raw body, Content-Type boundary and X-Index-* headers).
  * Hermes re-verifies the same bytes, so we never touch the body.
  *
+ * Any webhook path is accepted and forwarded verbatim under the configured Hermes root:
+ * `POST /webhooks/<route>` and `POST /p/<profile>/webhooks/<route>`.
+ *
  * Durability: if Hermes is unreachable or transiently failing, the request is buffered
  * in SQLite and retried with backoff. Hermes rejects requests whose X-Index-Timestamp is
  * more than 300s old, so buffered retries are re-signed with a fresh timestamp — the raw
@@ -16,13 +19,14 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { mkdirSync } from "fs";
 
 const PORT = parseInt(process.env.PORT || "8655", 10);
-const SECRET =
-  process.env.PEBBLE_INDEX_WEBHOOK_SECRET ||
-  process.env.pebbleIndexWebhookSecret ||
-  "";
-const HERMES_URL =
-  process.env.HERMES_WEBHOOK_URL ||
-  "http://127.0.0.1:8644/webhooks/pebble-index";
+// Origin of the Hermes webhook listener. The relay preserves the incoming path, so
+// `POST /webhooks/<route>` becomes `<root>/webhooks/<route>`. A trailing `/webhooks`
+// is tolerated so either `http://host:8644` or `http://host:8644/webhooks` works.
+const HERMES_WEBHOOK_ROOT = (
+  process.env.HERMES_WEBHOOK_ROOT || "http://127.0.0.1:8644"
+)
+  .replace(/\/+$/, "")
+  .replace(/\/webhooks$/, "");
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const WINDOW_SECONDS = parseInt(
   process.env.TIMESTAMP_WINDOW_SECONDS || "300",
@@ -31,9 +35,27 @@ const WINDOW_SECONDS = parseInt(
 const BACKOFF_SECONDS = [5, 30, 120, 600, 3600];
 const INITIAL_RETRY_DELAYS_MS = [250, 500]; // short in-request retries
 
-if (!SECRET) {
-  console.error("FATAL: PEBBLE_INDEX_WEBHOOK_SECRET is not set");
-  process.exit(1);
+// Per-route secrets from the environment: `WEBHOOK_SECRET_<ROUTE>`, where the route is
+// uppercased and every non-alphanumeric character becomes `_` (env names cannot hold `-`).
+// `foo-bar` and `foo_bar` therefore share a variable; the path is always forwarded as
+// received, and Hermes is the final judge of which routes exist. There is no fallback:
+// a route with no configured secret is rejected.
+const SECRET_ENV_PREFIX = "WEBHOOK_SECRET_";
+
+function routeSecretEnvKey(route: string): string {
+  return SECRET_ENV_PREFIX + route.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+}
+
+function routeSecret(route: string): string | undefined {
+  return process.env[routeSecretEnvKey(route)];
+}
+
+function configuredRoutes(): string {
+  const routes = Object.keys(process.env)
+    .filter((key) => key.startsWith(SECRET_ENV_PREFIX))
+    .map((key) => key.slice(SECRET_ENV_PREFIX.length).toLowerCase())
+    .sort();
+  return routes.length ? routes.join(", ") : "(none)";
 }
 
 mkdirSync(DATA_DIR, { recursive: true });
@@ -45,6 +67,7 @@ db.exec(`
     received_at     INTEGER NOT NULL,
     body            BLOB NOT NULL,
     headers         TEXT NOT NULL,
+    path            TEXT NOT NULL DEFAULT '/webhooks/pebble-index',
     status          TEXT NOT NULL DEFAULT 'pending',
     attempts        INTEGER NOT NULL DEFAULT 0,
     next_attempt_at INTEGER NOT NULL DEFAULT 0,
@@ -55,12 +78,22 @@ db.exec(`
 db.exec(
   "CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON deliveries(status, next_attempt_at);",
 );
+// Migration for databases created before `path` existed.
+const deliveryColumns = db
+  .query("PRAGMA table_info(deliveries)")
+  .all() as { name: string }[];
+if (!deliveryColumns.some((c) => c.name === "path")) {
+  db.exec(
+    "ALTER TABLE deliveries ADD COLUMN path TEXT NOT NULL DEFAULT '/webhooks/pebble-index'",
+  );
+}
 
 interface DeliveryRow {
   delivery_id: string;
   received_at: number;
   body: Uint8Array;
   headers: string;
+  path: string;
   status: string;
   attempts: number;
   next_attempt_at: number;
@@ -123,6 +156,21 @@ function headersToHeadersObject(record: Record<string, string>): Headers {
   return h;
 }
 
+const WEBHOOK_PATH = /^\/webhooks\/.+/;
+const PROFILED_WEBHOOK_PATH = /^\/p\/[^/]+\/webhooks\/.+/;
+
+function isWebhookPath(pathname: string): boolean {
+  return WEBHOOK_PATH.test(pathname) || PROFILED_WEBHOOK_PATH.test(pathname);
+}
+
+function routeFromPath(path: string): string {
+  return path.replace(/^.*\/webhooks\//, "");
+}
+
+function targetUrl(path: string): string {
+  return `${HERMES_WEBHOOK_ROOT}${path}`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -148,6 +196,7 @@ function summarize(
 }
 
 function logRequest(fields: {
+  route: string;
   delivery: string;
   trigger: string;
   test: boolean;
@@ -157,7 +206,7 @@ function logRequest(fields: {
   latencyMs: number;
 }): void {
   console.log(
-    `delivery=${fields.delivery} trigger=${fields.trigger} test=${fields.test} ` +
+    `route=${fields.route} delivery=${fields.delivery} trigger=${fields.trigger} test=${fields.test} ` +
       `transcription_len=${fields.transcriptionLength} audio=${fields.audio} ` +
       `forward=${fields.forward} latency_ms=${Math.round(fields.latencyMs)}`,
   );
@@ -168,19 +217,21 @@ function logRequest(fields: {
 async function forward(
   headers: Headers,
   body: Uint8Array,
+  path: string,
 ): Promise<Response> {
-  return fetch(HERMES_URL, { method: "POST", headers, body });
+  return fetch(targetUrl(path), { method: "POST", headers, body });
 }
 
 async function forwardNow(
   headers: Headers,
   body: Uint8Array,
+  path: string,
 ): Promise<{ response: Response | null; error: unknown }> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt <= INITIAL_RETRY_DELAYS_MS.length; attempt++) {
     if (attempt > 0) await sleep(INITIAL_RETRY_DELAYS_MS[attempt - 1]!);
     try {
-      const response = await forward(headers, body);
+      const response = await forward(headers, body, path);
       if (response.ok || !isTransient(response.status)) {
         return { response, error: null };
       }
@@ -209,12 +260,13 @@ function enqueue(
   receivedAt: number,
   body: Uint8Array,
   headers: Record<string, string>,
+  path: string,
 ): boolean {
   const res = db.run(
     `INSERT OR IGNORE INTO deliveries
-       (delivery_id, received_at, body, headers, status, attempts, next_attempt_at)
-     VALUES (?, ?, ?, ?, 'pending', 0, 0)`,
-    [deliveryId, receivedAt, body, JSON.stringify(headers)],
+       (delivery_id, received_at, body, headers, path, status, attempts, next_attempt_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 0, 0)`,
+    [deliveryId, receivedAt, body, JSON.stringify(headers), path],
   );
   return res.changes > 0;
 }
@@ -278,18 +330,27 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   const trigger = headers.get("x-index-trigger") || "";
   const isTest =
     (headers.get("x-index-test") || "").trim().toLowerCase() === "true";
+  const route = routeFromPath(row.path);
+  const secret = routeSecret(route);
+  if (!secret) {
+    markFailed(row.delivery_id, "route no longer configured");
+    console.warn(
+      `route=${route} delivery=${row.delivery_id} outcome=unconfigured`,
+    );
+    return;
+  }
   // Re-sign with a fresh timestamp; body bytes are unchanged.
   headers.set("x-index-timestamp", timestamp);
   headers.set(
     "x-index-signature",
-    signIndex(SECRET, version, timestamp, row.delivery_id, trigger, isTest, row.body),
+    signIndex(secret, version, timestamp, row.delivery_id, trigger, isTest, row.body),
   );
 
   const started = performance.now();
   let response: Response | null = null;
   let error: unknown = null;
   try {
-    response = await forward(headers, row.body);
+    response = await forward(headers, row.body, row.path);
   } catch (e) {
     error = e;
   }
@@ -299,11 +360,11 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   if (response && response.ok) {
     markForwarded(row.delivery_id);
     logRequest({
+      route: routeFromPath(row.path),
       delivery: row.delivery_id,
       trigger,
       test: isTest,
-      transcriptionLength: 0,
-      audio: headers.has("x-audio-size"),
+      ...summarize(row.body, headers),
       forward: forwardResult,
       latencyMs: performance.now() - started,
     });
@@ -312,13 +373,13 @@ async function retryOne(row: DeliveryRow): Promise<void> {
   if (response && !isTransient(response.status)) {
     markFailed(row.delivery_id, `upstream ${response.status}`);
     console.warn(
-      `delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts}`,
+      `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=permanent-failure attempt=${attempts}`,
     );
     return;
   }
   markPending(row.delivery_id, attempts, error instanceof Error ? error.message : forwardResult);
   console.log(
-    `delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts}`,
+    `route=${routeFromPath(row.path)} delivery=${row.delivery_id} forward=${forwardResult} outcome=retry-scheduled attempt=${attempts}`,
   );
 }
 
@@ -337,7 +398,7 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    if (url.pathname === "/healthz") {
+    if (url.pathname === "/health") {
       return json({
         ok: true,
         queue_depth: queueDepth(),
@@ -346,10 +407,12 @@ Bun.serve({
       });
     }
 
-    if (url.pathname !== "/webhooks/pebble-index" || req.method !== "POST") {
+    if (!isWebhookPath(url.pathname) || req.method !== "POST") {
       return json({ error: "not found" }, 404);
     }
 
+    const route = routeFromPath(url.pathname);
+    const forwardPath = `${url.pathname}${url.search}`;
     const started = performance.now();
     const body = new Uint8Array(await req.arrayBuffer());
 
@@ -374,8 +437,15 @@ Bun.serve({
     if (age > WINDOW_SECONDS) {
       return json({ error: "timestamp outside replay window" }, 401);
     }
+    const secret = routeSecret(route);
+    if (!secret) {
+      console.warn(
+        `route=${route} outcome=unconfigured (no ${routeSecretEnvKey(route)})`,
+      );
+      return json({ error: "route not configured" }, 401);
+    }
     const expected = signIndex(
-      SECRET,
+      secret,
       version,
       timestamp,
       deliveryId,
@@ -391,8 +461,9 @@ Bun.serve({
     const forwardHeadersRecord = collectForwardHeaders(req.headers);
 
     // Reserve the delivery id first so a concurrent repeat cannot double-forward.
-    if (!enqueue(deliveryId, Date.now(), body, forwardHeadersRecord)) {
+    if (!enqueue(deliveryId, Date.now(), body, forwardHeadersRecord, forwardPath)) {
       logRequest({
+        route,
         delivery: deliveryId,
         trigger,
         test: isTest,
@@ -406,12 +477,14 @@ Bun.serve({
     const { response, error } = await forwardNow(
       headersToHeadersObject(forwardHeadersRecord),
       body,
+      forwardPath,
     );
     const forward = setLastForward(response, error);
 
     if (response && response.ok) {
       markForwarded(deliveryId);
       logRequest({
+        route,
         delivery: deliveryId,
         trigger,
         test: isTest,
@@ -429,6 +502,7 @@ Bun.serve({
       // Permanent 4xx (bad route, body cap, auth mismatch). Retrying will not help.
       markFailed(deliveryId, `upstream ${response.status}`);
       logRequest({
+        route,
         delivery: deliveryId,
         trigger,
         test: isTest,
@@ -445,6 +519,7 @@ Bun.serve({
     // Transient: buffered and retried in the background.
     markPending(deliveryId, 1, error instanceof Error ? error.message : forward);
     logRequest({
+      route,
       delivery: deliveryId,
       trigger,
       test: isTest,
@@ -457,7 +532,8 @@ Bun.serve({
 });
 
 console.log(
-  `pebble-hermes-relay listening on :${PORT} → ${HERMES_URL} (data ${DATA_DIR})`,
+  `pebble-hermes-relay listening on :${PORT} → ${HERMES_WEBHOOK_ROOT} ` +
+    `(data ${DATA_DIR}; routes: ${configuredRoutes()})`,
 );
 
 setInterval(() => {

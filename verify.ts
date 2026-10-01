@@ -9,22 +9,18 @@
  *   bun verify.ts downtime        # spawns relay locally against a dead port, then restores
  *   bun verify.ts all             # happy+tamper+replay against RELAY_URL, then the two local tests
  *
- * The secret is read from PEBBLE_INDEX_WEBHOOK_SECRET (or pebbleIndexWebhookSecret) and is
- * never printed.
+ * The route secret is read from WEBHOOK_SECRET_PEBBLE_INDEX and is never printed.
  */
 import { createHash, createHmac, randomUUID } from "crypto";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-const SECRET =
-  process.env.PEBBLE_INDEX_WEBHOOK_SECRET ||
-  process.env.pebbleIndexWebhookSecret ||
-  "";
+const SECRET = process.env.WEBHOOK_SECRET_PEBBLE_INDEX || "";
 const RELAY_URL = process.env.RELAY_URL || "http://127.0.0.1:8655";
 
 if (!SECRET) {
-  console.error("FATAL: PEBBLE_INDEX_WEBHOOK_SECRET is not set");
+  console.error("FATAL: WEBHOOK_SECRET_PEBBLE_INDEX is not set");
   process.exit(2);
 }
 
@@ -117,8 +113,9 @@ async function post(
   url: string,
   req: SignedRequest,
   override?: { body?: Uint8Array; signature?: string },
+  path = "/webhooks/pebble-index",
 ): Promise<{ status: number; text: string }> {
-  const res = await fetch(`${url}/webhooks/pebble-index`, {
+  const res = await fetch(`${url}${path}`, {
     method: "POST",
     headers: {
       "content-type": req.contentType,
@@ -134,8 +131,8 @@ async function post(
   return { status: res.status, text: await res.text() };
 }
 
-async function healthz(url: string): Promise<any> {
-  const res = await fetch(`${url}/healthz`);
+async function checkHealth(url: string): Promise<any> {
+  const res = await fetch(`${url}/health`);
   return res.json();
 }
 
@@ -187,7 +184,7 @@ async function waitForHealth(url: string, timeoutMs = 15000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${url}/healthz`);
+      const res = await fetch(`${url}/health`);
       if (res.ok) return;
     } catch {
       // not up yet
@@ -207,9 +204,12 @@ async function startRelay(
     env: {
       ...process.env,
       PORT: String(port),
-      HERMES_WEBHOOK_URL: hermesUrl,
-      PEBBLE_INDEX_WEBHOOK_SECRET: SECRET,
+      HERMES_WEBHOOK_ROOT: hermesUrl,
       DATA_DIR: dataDir,
+      // Route secrets for the routes the local tests exercise.
+      WEBHOOK_SECRET_PEBBLE_INDEX: SECRET,
+      WEBHOOK_SECRET_OTHER_ROUTE: SECRET,
+      WEBHOOK_SECRET_ANOTHER: SECRET,
     },
     stdout: "inherit",
     stderr: "inherit",
@@ -224,6 +224,7 @@ async function stopRelay(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
 }
 
 interface Echo {
+  path: string;
   sha256: string;
   signature: string | null;
   timestamp: string | null;
@@ -238,6 +239,7 @@ function startEcho(): { server: ReturnType<typeof Bun.serve>; seen: Echo[]; url:
     async fetch(req) {
       const body = new Uint8Array(await req.arrayBuffer());
       seen.push({
+        path: new URL(req.url).pathname,
         sha256: sha256(body),
         signature: req.headers.get("x-index-signature"),
         timestamp: req.headers.get("x-index-timestamp"),
@@ -247,7 +249,7 @@ function startEcho(): { server: ReturnType<typeof Bun.serve>; seen: Echo[]; url:
       return new Response("OK", { status: 200 });
     },
   });
-  return { server, seen, url: `http://127.0.0.1:${server.port}/webhooks/pebble-index` };
+  return { server, seen, url: `http://127.0.0.1:${server.port}` };
 }
 
 let nextPort = 18655;
@@ -268,11 +270,12 @@ async function byteExact(): Promise<boolean> {
     }
     const hashOk = got.sha256 === sha256(req.body);
     const sigOk = got.signature === req.signature;
+    const pathOk = got.path === "/webhooks/pebble-index";
     console.log(
-      `[byte-exact] status=${status} hash_match=${hashOk} signature_unchanged=${sigOk} ok=${hashOk && sigOk}`,
+      `[byte-exact] status=${status} hash_match=${hashOk} signature_unchanged=${sigOk} path_ok=${pathOk} ok=${hashOk && sigOk && pathOk}`,
     );
     console.log(`[byte-exact] sent_sha256=${sha256(req.body)} echoed_sha256=${got.sha256}`);
-    return hashOk && sigOk;
+    return hashOk && sigOk && pathOk;
   } finally {
     await stopRelay(proc);
     echo.server.stop(true);
@@ -283,14 +286,14 @@ async function byteExact(): Promise<boolean> {
 async function downtime(): Promise<boolean> {
   const echo = startEcho();
   const dataDir = mkdtempSync(join(tmpdir(), "pebble-relay-"));
-  const deadUrl = "http://127.0.0.1:1/webhooks/pebble-index";
+  const deadUrl = "http://127.0.0.1:1";
   const port = nextPort++;
   const req = makeSigned({ transcription: "downtime test" });
 
   let first = await startRelay(port, deadUrl, dataDir);
   try {
     const { status } = await post(`http://127.0.0.1:${port}`, req);
-    const health = await healthz(`http://127.0.0.1:${port}`);
+    const health = await checkHealth(`http://127.0.0.1:${port}`);
     const buffered = status >= 200 && status < 300 && health.queue_depth >= 1;
     console.log(
       `[downtime] buffered_status=${status} queue_depth=${health.queue_depth} ok=${buffered}`,
@@ -307,10 +310,11 @@ async function downtime(): Promise<boolean> {
     const forwardedOnce = echo.seen.length === 1;
     const bytesIntact = !!got && Buffer.compare(Buffer.from(got.body), Buffer.from(req.body)) === 0;
     const resigned = !!got && got.timestamp !== req.timestamp && got.signature !== req.signature;
-    const ok = buffered && forwardedOnce && bytesIntact && resigned;
+    const pathOk = !!got && got.path === "/webhooks/pebble-index";
+    const ok = buffered && forwardedOnce && bytesIntact && resigned && pathOk;
     console.log(
       `[downtime] forwarded_count=${echo.seen.length} bytes_intact=${bytesIntact} ` +
-        `resigned=${resigned} ok=${ok}`,
+        `resigned=${resigned} path_ok=${pathOk} ok=${ok}`,
     );
     if (got) {
       console.log(
@@ -326,8 +330,30 @@ async function downtime(): Promise<boolean> {
   }
 }
 
-// ── main ────────────────────────────────────────────────────────────────────
+async function pathForwarding(): Promise<boolean> {
+  const echo = startEcho();
+  const dataDir = mkdtempSync(join(tmpdir(), "pebble-relay-"));
+  const port = nextPort++;
+  const proc = await startRelay(port, echo.url, dataDir);
+  const wanted = ["/webhooks/other-route", "/p/default/webhooks/another"];
+  try {
+    for (const path of wanted) {
+      const req = makeSigned({ transcription: "path test" });
+      await post(`http://127.0.0.1:${port}`, req, undefined, path);
+    }
+    await Bun.sleep(300);
+    const forwarded = echo.seen.map((e) => e.path);
+    const ok = wanted.every((p) => forwarded.includes(p));
+    console.log(`[paths] forwarded=${JSON.stringify(forwarded)} ok=${ok}`);
+    return ok;
+  } finally {
+    await stopRelay(proc);
+    echo.server.stop(true);
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+}
 
+// ── main ────────────────────────────────────────────────────────────────────
 const cmd = process.argv[2] || "all";
 const results: Record<string, boolean> = {};
 
@@ -347,6 +373,9 @@ switch (cmd) {
   case "downtime":
     results.downtime = await downtime();
     break;
+  case "paths":
+    results.paths = await pathForwarding();
+    break;
   case "all":
   default:
     console.log(`# remote tests against ${RELAY_URL}`);
@@ -356,6 +385,7 @@ switch (cmd) {
     console.log("# local tests");
     results["byte-exact"] = await byteExact();
     results.downtime = await downtime();
+    results.paths = await pathForwarding();
     break;
 }
 
